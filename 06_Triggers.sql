@@ -1,107 +1,116 @@
--- ============================================
--- TRIGGERS
--- Automatically executed when events happen
--- ============================================
+USE coding_challenge_platform;
 
-
--- ============================================
--- 1. TRIGGER: ASSIGN PIXEL AFTER SUCCESSFUL SUBMISSION
--- ============================================
-
--- When a new submission is inserted:
--- If result = 'Accepted', assign a pixel to that user
+DROP TRIGGER IF EXISTS trg_submissions_before_insert;
+DROP TRIGGER IF EXISTS trg_submissions_after_insert;
+DROP TRIGGER IF EXISTS trg_pixels_after_update;
+DROP TRIGGER IF EXISTS trg_submission_test_results_before_insert;
 
 DELIMITER $$
 
-CREATE TRIGGER assign_pixel_after_success
-AFTER INSERT ON SUBMISSIONS
+-- Normalize missing metrics and reject submissions that arrive too quickly for the same challenge.
+CREATE TRIGGER trg_submissions_before_insert
+BEFORE INSERT ON submissions
 FOR EACH ROW
 BEGIN
+    DECLARE v_last_submission_time DATETIME;
 
-    -- IF condition checks the inserted row (NEW)
+    IF NEW.execution_time_ms IS NULL OR NEW.execution_time_ms <= 0 THEN
+        SET NEW.execution_time_ms = 1.00;
+    END IF;
+
+    IF NEW.memory_kb IS NULL OR NEW.memory_kb <= 0 THEN
+        SET NEW.memory_kb = 256;
+    END IF;
+
+    IF NEW.submitted_at IS NULL THEN
+        SET NEW.submitted_at = CURRENT_TIMESTAMP;
+    END IF;
+
+    SELECT MAX(submitted_at)
+    INTO v_last_submission_time
+    FROM submissions
+    WHERE user_id = NEW.user_id
+      AND challenge_id = NEW.challenge_id;
+
+    IF v_last_submission_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, v_last_submission_time, NEW.submitted_at) < 5 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Submission must be at least 5 seconds after the previous submission for the same challenge.';
+    END IF;
+END$$
+
+-- Accepted submissions claim the first available pixel for that challenge.
+CREATE TRIGGER trg_submissions_after_insert
+AFTER INSERT ON submissions
+FOR EACH ROW
+BEGIN
+    DECLARE v_pixel_id INT DEFAULT NULL;
+
     IF NEW.result = 'Accepted' THEN
-
-        -- assign a pixel that belongs to the challenge
-        UPDATE PIXELS
-        SET user_id = NEW.user_id
+        SELECT pixel_id
+        INTO v_pixel_id
+        FROM pixels
         WHERE challenge_id = NEW.challenge_id
-        AND user_id IS NULL   -- only free pixels
+          AND owner_user_id IS NULL
+        ORDER BY x_coordinate, y_coordinate, pixel_id
         LIMIT 1;
 
+        IF v_pixel_id IS NOT NULL THEN
+            UPDATE pixels
+            SET owner_user_id = NEW.user_id,
+                acquired_submission_id = NEW.submission_id,
+                last_updated = NEW.submitted_at
+            WHERE pixel_id = v_pixel_id;
+        END IF;
     END IF;
-
 END$$
 
-DELIMITER ;
-
-
--- ============================================
--- 2. TRIGGER: LOG PIXEL OWNERSHIP CHANGES
--- ============================================
-
--- When a pixel owner changes, store it in PIXELHISTORY
-
-DELIMITER $$
-
-CREATE TRIGGER log_pixel_change
-AFTER UPDATE ON PIXELS
+-- NULL-safe comparison (<=>) is required so ownership changes involving NULL are not missed.
+CREATE TRIGGER trg_pixels_after_update
+AFTER UPDATE ON pixels
 FOR EACH ROW
 BEGIN
-
-    -- check if owner changed
-    IF OLD.user_id <> NEW.user_id THEN
-
-        INSERT INTO PIXELHISTORY (
+    IF NOT (OLD.owner_user_id <=> NEW.owner_user_id) OR NOT (OLD.color <=> NEW.color) THEN
+        INSERT INTO pixel_history (
             pixel_id,
-            previous_owner_id,
-            new_owner_id
+            challenge_id,
+            previous_owner_user_id,
+            new_owner_user_id,
+            changed_by_submission_id,
+            color_before,
+            color_after,
+            change_type,
+            changed_at
         )
         VALUES (
-            OLD.pixel_id,
-            OLD.user_id,
-            NEW.user_id
+            NEW.pixel_id,
+            NEW.challenge_id,
+            OLD.owner_user_id,
+            NEW.owner_user_id,
+            NEW.acquired_submission_id,
+            OLD.color,
+            NEW.color,
+            CASE
+                WHEN OLD.owner_user_id IS NULL AND NEW.owner_user_id IS NOT NULL THEN 'ASSIGNED'
+                WHEN OLD.owner_user_id IS NOT NULL AND NEW.owner_user_id IS NULL THEN 'RELEASED'
+                WHEN NOT (OLD.owner_user_id <=> NEW.owner_user_id) THEN 'REASSIGNED'
+                ELSE 'RECOLORED'
+            END,
+            CURRENT_TIMESTAMP
         );
-
     END IF;
-
 END$$
 
-DELIMITER ;
-
-
--- ============================================
--- 3. TRIGGER: PREVENT TOO FAST SUBMISSIONS
--- ============================================
-
--- Prevent user from submitting too frequently (e.g. < 5 seconds)
-
-DELIMITER $$
-
-CREATE TRIGGER prevent_fast_submissions
-BEFORE INSERT ON SUBMISSIONS
+-- If a per-test runtime is omitted, inherit a sensible value from the parent submission.
+CREATE TRIGGER trg_submission_test_results_before_insert
+BEFORE INSERT ON submission_test_results
 FOR EACH ROW
 BEGIN
-
-    DECLARE last_time TIMESTAMP;
-
-    -- get last submission time of this user for this challenge
-    SELECT MAX(submitted_at)
-    INTO last_time
-    FROM SUBMISSIONS
-    WHERE user_id = NEW.user_id
-    AND challenge_id = NEW.challenge_id;
-
-    -- check time difference
-    IF last_time IS NOT NULL AND TIMESTAMPDIFF(SECOND, last_time, NOW()) < 5 THEN
-        SIGNAL SQLSTATE '45000'
-        SET MESSAGE_TEXT = 'Submission too fast. Please wait.';
+    IF NEW.execution_time_ms IS NULL OR NEW.execution_time_ms <= 0 THEN
+        SET NEW.execution_time_ms = COALESCE(
+            (SELECT execution_time_ms FROM submissions WHERE submission_id = NEW.submission_id),
+            1.00
+        );
     END IF;
-
 END$$
 
 DELIMITER ;
-
-
--- ============================================
--- END OF TRIGGERS
--- ============================================
